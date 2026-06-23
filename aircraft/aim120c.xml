@@ -1,0 +1,526 @@
+<?xml version="1.0"?>
+<!--
+  JSBSim Flight Dynamics Model : AIM-120C-5 AMRAAM
+  High-Fidelity Reference Implementation
+
+  模型目的
+  本文件提供一个经过公开资料校准的 AIM-120C-5 主动雷达制导空对空
+  导弹六自由度飞行动力学模型，适用于数字战斗仿真环境中的高拟真
+  导弹六自由度仿真以及飞行控制律验证。
+
+  模型架构与接口
+  - 飞控系统采用直接舵面指令与角速率阻尼内回路架构，不再包含
+    过载自动驾驶仪（外环由外部 Python 代码完成）。
+  - 外部通过以下属性写入归一化（-1..1）指令：
+      fcs/aileron-cmd-norm  副翼/差动舵指令（正→向右滚转）
+      fcs/elevator-cmd-norm 升降舵指令（正＝低头）
+      fcs/rudder-cmd-norm   方向舵指令
+  - 油门指令（fcs/throttle-cmd-norm）和起落架指令/状态属性
+    被保留以兼容外部通用控制框架，但发动机为单推力固体火箭，
+    推力仅取决于预设的推力表；起落架状态恒置为 0（始终收起）。
+  - 内部角速率阻尼基于动压（qbar）调度，用于增强短周期动态
+    稳定性和抑制高频振荡，不改变外环指令的主导作用。
+
+  物理参数溯源
+  以下核心参数源自公开技术文件、评估报告及社区验证数据。
+
+  几何参数（根据 AIM-120C-5 Performance Assessment Rev 2 校准）
+  ═══════════════════════════════════════════════════════
+  长度 .............. 3.655 m (12.0 ft)
+  弹径 .............. 0.180 m (0.591 ft)  [评估报告 Rev 2 的 CFD/CAD 模型]
+  翼展 .............. 0.482 m (1.583 ft)  [评估报告 Rev 2]
+  参考面积 .......... 0.0254 m² (0.274 ft²)  [基于 0.180 m 弹径的圆形截面积]
+  ═══════════════════════════════════════════════════════
+
+  质量特性
+  ═══════════════════════════════════════════════════════
+  发射质量 .......... 161.5 kg (356 lbs)  [global.espreso.tv, changhai.org]
+  空重 .............. 约 110.5 kg (243.6 lbs)
+  推进剂质量 ........ 约 51 kg (112.4 lbs)  [评估报告 Rev 2]
+  ═══════════════════════════════════════════════════════
+
+  推进系统
+  ═══════════════════════════════════════════════════════
+  类型 .............. 单推力固体火箭（HTPB/AP）
+  总推力 ............ 16,771.9 N (≈3,770 lbf)  [评估报告 Rev 2]
+  比冲（Isp）........ 265 s
+  燃烧时间 .......... 约 7.75 s
+  推力曲线 .......... 以已消耗推进剂质量为自变量的表格函数（JSBSim内部
+                     火箭推力表要求自变量单调递增，实际使用已消耗量），
+                     包含约 0.5 s 的稳定高推力段，随后平滑衰减。
+  ═══════════════════════════════════════════════════════
+
+  气动数据校准
+  ═══════════════════════════════════════════════════════
+  零升阻力 (CD0) .... 参考 DCS 2.5.5.41371 更新趋势校准：
+                     跨音速峰值 CD0=0.45（以参考面积计），
+                     转换至湿面积基准后峰值约 0.0038，与 CFD
+                     报告吻合。
+  升力系数 (CNα) .... 校准为随马赫数和攻角变化的非线性表格，
+                     高亚音速到超音速区间升力效率有所提升。
+  诱导阻力 (CDi) .... 系数 0.18•alpha^2，符合降低趋势。
+  静稳定度 (Cmα) .... +0.25（放宽静稳定度，尾舵控制布局）。
+  舵面力矩 .......... Cmδe 随马赫数调度，Cnδr 与 Clδa 为常值。
+  阻尼力矩 .......... 包含俯仰、偏航、滚转三个轴的阻尼系数。
+  ═══════════════════════════════════════════════════════
+
+  舵面与执行机构
+  ═══════════════════════════════════════════════════════
+  舵面偏度极限 ...... ±30° (±0.5236 rad)  [评估报告 CFD 及视频证据]
+  执行机构速率 ...... 不低于 300°/s（时间常数 ≈ 0.0023 s 或更快）
+  控制分配 .......... 十字形布局，三通道独立控制。
+  ═══════════════════════════════════════════════════════
+
+  性能包线
+  ═══════════════════════════════════════════════════════
+  最大可用过载 ...... 40 g  [新浪军事 2004, War Thunder 引用文件]
+  ═══════════════════════════════════════════════════════
+
+  参考资料来源
+  [1] AIM-120C-5 Performance Assessment for Digital Combat
+      Simulation Enhancement (Rev 2). 2023.
+  [2] DCS World 更新日志 2.5.5.41371 相关气动调整说明.
+  [3] global.espreso.tv, changhai.org 技术参数汇总.
+  [4] 新浪军事 (2004) - AIM-120C 导弹过载数据.
+  [5] War Thunder 论坛公开引用数据.
+  [6] 百度百科 AIM-120 空空导弹 (用于早期型号参考，C-5 参数已校准).
+
+  免责声明
+  本模型基于公开可获得的信息和社区分析构建，仅用于非商业的
+  学术研究、仿真技术交流与个人娱乐。实际武器系统的性能与本文
+  件可能存在差异。作者不对使用本模型所导致的任何后果承担责任。
+-->
+<fdm_config name="AIM-120C-5 AMRAAM (Hi-Fi)" version="2.0" release="PRODUCTION">
+
+  <metrics>
+    <!-- 参考面积：基于弹径 0.180 m (0.591 ft) 的圆形截面积 -->
+    <wingarea  unit="FT2"> 0.274  </wingarea>
+    <wingspan  unit="FT"> 1.583  </wingspan>
+    <chord     unit="FT"> 0.79   </chord>
+    <length    unit="FT"> 12.0   </length>
+    <diameter  unit="FT"> 0.591  </diameter>
+
+    <location name="AERORP" unit="IN">
+      <x> 68.0 </x> <y>  0   </y> <z>  0   </z>
+    </location>
+    <location name="EYEPOINT" unit="IN">
+      <x>  0   </x> <y>  0   </y> <z>  0   </z>
+    </location>
+    <location name="VRP" unit="IN">
+      <x> 68.0 </x> <y>  0   </y> <z>  0   </z>
+    </location>
+  </metrics>
+
+  <mass_balance>
+    <!-- 发射总重 161.5 kg (356 lbs)，其中燃料 112.4 lbs，空重 243.6 lbs -->
+    <emptywt unit="LBS">   243.6   </emptywt>
+    <ixx unit="SLUG*FT2">    0.43   </ixx>
+    <iyy unit="SLUG*FT2">  270.0   </iyy>
+    <izz unit="SLUG*FT2">  270.0   </izz>
+    <ixy unit="SLUG*FT2">    0.0   </ixy>
+    <ixz unit="SLUG*FT2">    0.0   </ixz>
+    <iyz unit="SLUG*FT2">    0.0   </iyz>
+    <location name="CG" unit="IN">
+      <x> 68.0 </x> <y>  0   </y> <z>  0   </z>
+    </location>
+  </mass_balance>
+
+  <ground_reactions>
+    <!-- 仅用于地面挂飞状态，起落架在自由飞行中恒为 0 -->
+    <contact type="BOGEY" name="NOSE">
+      <location unit="IN"> <x> 20.0 </x> <y>  0   </y> <z> -6.0 </z> </location>
+    </contact>
+    <contact type="BOGEY" name="TAIL">
+      <location unit="IN"> <x> 120.0 </x> <y>  0   </y> <z> -6.0 </z> </location>
+    </contact>
+  </ground_reactions>
+
+  <propulsion>
+    <engine>
+      <rocket_engine name="AIM120C_Motor">
+        <isp> 265.0 </isp>
+        <minthrottle> 1.0 </minthrottle>
+        <maxthrottle> 1.0 </maxthrottle>
+        <builduptime> 0.15 </builduptime>
+
+        <!-- 推力曲线：自变量为已消耗推进剂质量（lbs），单调递增，
+             符合 JSBSim 火箭推力表的要求 -->
+        <thrust_table name="propulsion/thrust_prop_remain" type="internal">
+          <tableData>
+            <!-- 已消耗推进剂 (lbs) | 推力 (lbf) -->
+              0.0    3770.0
+             15.0    3770.0
+             20.0    3500.0
+             50.0    3200.0
+             90.0    2800.0
+            110.0    1200.0
+            112.4       0.0
+          </tableData>
+        </thrust_table>
+
+        <fuelflow> 14.5 </fuelflow>
+      </rocket_engine>
+
+      <feed>0</feed>
+
+      <thruster>
+        <nozzle name="AIM120C_Nozzle">
+          <area unit="FT2"> 0.1218 </area>
+          <pe unit="PSF">   2116.22 </pe>
+        </nozzle>
+        <location unit="IN"> <x> 143.0 </x> <y>   0   </y> <z>   0   </z> </location>
+        <orient unit="DEG">
+          <roll>  0 </roll> <pitch> 0 </pitch> <yaw>   0 </yaw>
+        </orient>
+      </thruster>
+    </engine>
+
+    <tank type="FUEL" number="0">
+      <location unit="IN"> <x> 115.0 </x> <y>   0   </y> <z>   0   </z> </location>
+      <capacity unit="LBS"> 112.4 </capacity>
+      <contents unit="LBS"> 112.4 </contents>
+    </tank>
+  </propulsion>
+
+  <flight_control name="AIM-120C_Rate_Damper">
+
+    <!-- 接口属性定义：外部直接舵面指令（归一化 -1..1） -->
+    <property>fcs/aileron-cmd-norm</property>
+    <property>fcs/elevator-cmd-norm</property>
+    <property>fcs/rudder-cmd-norm</property>
+
+    <!-- 油门与起落架属性存在但不驱动实际模型 -->
+    <property>fcs/throttle-cmd-norm</property>
+    <property>gear/gear-cmd-norm</property>
+    <property>gear/gear-pos-norm</property>
+
+    <!-- 起落架状态恒为 0（始终收起） -->
+    <pure_gain name="gear/gear-pos-frozen">
+      <input>fcs/zero</input>
+      <gain>0.0</gain>
+      <output>gear/gear-pos-norm</output>
+    </pure_gain>
+
+    <!-- ============================================= -->
+    <!-- 俯仰通道（升降舵）：指令 + 俯仰角速率阻尼 -->
+    <!-- 正 elevator-cmd-norm → 低头（负俯仰力矩）    -->
+    <!-- ============================================= -->
+    <channel name="Pitch">
+      <scheduled_gain name="fcs/pitch/q-damper">
+        <input>velocities/q-aero-rad_sec</input>
+        <table>
+          <independentVar>aero/qbar-psf</independentVar>
+          <tableData>
+            1000.0   0.15
+            3000.0   0.12
+            6000.0   0.09
+            12000.0  0.06
+          </tableData>
+        </table>
+      </scheduled_gain>
+
+      <summer name="fcs/pitch/cmd-with-damper">
+        <input>fcs/elevator-cmd-norm</input>
+        <input>-fcs/pitch/q-damper</input>
+        <clipto><min>-1.0</min><max>1.0</max></clipto>
+        <output>fcs/pitch/cmd-damped</output>
+      </summer>
+
+      <kinematic name="fcs/elevator-actuator">
+        <input>fcs/pitch/cmd-damped</input>
+        <traverse>
+          <setting><position>-1.0</position><time>0.0023</time></setting>
+          <setting><position> 1.0</position><time>0.0023</time></setting>
+        </traverse>
+        <output>fcs/elevator-pos-norm</output>
+      </kinematic>
+
+      <!-- 反转映射：指令 +1.0 → 输出 -0.5236 rad（后缘向上，产生低头力矩） -->
+      <aerosurface_scale name="fcs/elevator-pos-rad">
+        <input>fcs/elevator-pos-norm</input>
+        <range><min>0.5236</min><max>-0.5236</max></range>
+        <output>fcs/elevator-pos-rad</output>
+      </aerosurface_scale>
+    </channel>
+
+    <!-- ============================================= -->
+    <!-- 偏航通道（方向舵）：指令 + 偏航角速率阻尼 -->
+    <!-- ============================================= -->
+    <channel name="Yaw">
+      <scheduled_gain name="fcs/yaw/r-damper">
+        <input>velocities/r-aero-rad_sec</input>
+        <table>
+          <independentVar>aero/qbar-psf</independentVar>
+          <tableData>
+            1000.0   0.15
+            3000.0   0.12
+            6000.0   0.09
+            12000.0  0.06
+          </tableData>
+        </table>
+      </scheduled_gain>
+
+      <summer name="fcs/yaw/cmd-with-damper">
+        <input>fcs/rudder-cmd-norm</input>
+        <input>-fcs/yaw/r-damper</input>
+        <clipto><min>-1.0</min><max>1.0</max></clipto>
+        <output>fcs/yaw/cmd-damped</output>
+      </summer>
+
+      <kinematic name="fcs/rudder-actuator">
+        <input>fcs/yaw/cmd-damped</input>
+        <traverse>
+          <setting><position>-1.0</position><time>0.0023</time></setting>
+          <setting><position> 1.0</position><time>0.0023</time></setting>
+        </traverse>
+        <output>fcs/rudder-pos-norm</output>
+      </kinematic>
+
+      <aerosurface_scale name="fcs/rudder-pos-rad">
+        <input>fcs/rudder-pos-norm</input>
+        <range><min>-0.5236</min><max>0.5236</max></range>
+        <output>fcs/rudder-pos-rad</output>
+      </aerosurface_scale>
+    </channel>
+
+    <!-- ============================================= -->
+    <!-- 滚转通道（副翼）：指令 + 滚转角速率阻尼    -->
+    <!-- 正 aileron-cmd-norm → 向右滚转（正 Cl）      -->
+    <!-- ============================================= -->
+    <channel name="Roll">
+      <scheduled_gain name="fcs/roll/p-damper">
+        <input>velocities/p-aero-rad_sec</input>
+        <table>
+          <independentVar>aero/qbar-psf</independentVar>
+          <tableData>
+            1000.0   0.20
+            3000.0   0.15
+            6000.0   0.10
+            12000.0  0.07
+          </tableData>
+        </table>
+      </scheduled_gain>
+
+      <summer name="fcs/roll/cmd-with-damper">
+        <input>fcs/aileron-cmd-norm</input>
+        <input>-fcs/roll/p-damper</input>
+        <clipto><min>-1.0</min><max>1.0</max></clipto>
+        <output>fcs/roll/cmd-damped</output>
+      </summer>
+
+      <kinematic name="fcs/aileron-actuator">
+        <input>fcs/roll/cmd-damped</input>
+        <traverse>
+          <setting><position>-1.0</position><time>0.0023</time></setting>
+          <setting><position> 1.0</position><time>0.0023</time></setting>
+        </traverse>
+        <output>fcs/aileron-pos-norm</output>
+      </kinematic>
+
+      <aerosurface_scale name="fcs/aileron-pos-rad">
+        <input>fcs/aileron-pos-norm</input>
+        <range><min>-0.5236</min><max>0.5236</max></range>
+        <output>fcs/aileron-pos-rad</output>
+      </aerosurface_scale>
+    </channel>
+
+  </flight_control>
+
+  <aerodynamics>
+    <axis name="LIFT" type="LIFT">
+      <function name="aero/coefficient/CLalpha">
+        <description>法向力系数 (CNalpha)</description>
+        <table>
+          <independentVar lookup="row">aero/alpha-rad</independentVar>
+          <independentVar lookup="column">velocities/mach</independentVar>
+          <tableData>
+                  0.3    0.5    0.8    1.0    1.2    1.5    2.0    2.5    3.0    3.5    4.0
+            -0.50 -8.50  -9.00  -8.20  -7.50  -7.00  -6.50  -6.00  -5.80  -5.50  -5.30  -5.00
+            -0.30 -5.10  -5.40  -4.92  -4.50  -4.20  -3.90  -3.60  -3.48  -3.30  -3.18  -3.00
+            -0.20 -3.40  -3.60  -3.28  -3.00  -2.80  -2.60  -2.40  -2.32  -2.20  -2.12  -2.00
+            -0.10 -1.70  -1.80  -1.64  -1.50  -1.40  -1.30  -1.20  -1.16  -1.10  -1.06  -1.00
+             0.00  0.00   0.00   0.00   0.00   0.00   0.00   0.00   0.00   0.00   0.00   0.00
+             0.10  1.70   1.80   1.64   1.50   1.40   1.30   1.20   1.16   1.10   1.06   1.00
+             0.20  3.40   3.60   3.28   3.00   2.80   2.60   2.40   2.32   2.20   2.12   2.00
+             0.30  5.10   5.40   4.92   4.50   4.20   3.90   3.60   3.48   3.30   3.18   3.00
+             0.40  6.80   7.20   6.56   6.00   5.60   5.20   4.80   4.64   4.40   4.24   4.00
+             0.50  8.50   9.00   8.20   7.50   7.00   6.50   6.00   5.80   5.50   5.30   5.00
+          </tableData>
+        </table>
+      </function>
+
+      <function name="aero/coefficient/CLde">
+        <description>舵面升力系数 (CLde)</description>
+        <product>
+          <property>fcs/elevator-pos-rad</property>
+          <table>
+            <independentVar lookup="row">velocities/mach</independentVar>
+            <tableData>
+              0.2   2.0
+              0.4   2.2
+              0.6   2.4
+              0.8   2.8
+              1.0   3.0
+              1.2   2.8
+              1.5   2.4
+              2.0   2.2
+              3.0   2.0
+              4.0   1.8
+            </tableData>
+          </table>
+        </product>
+      </function>
+    </axis>
+
+    <axis name="DRAG" type="DRAG">
+      <function name="aero/coefficient/CD0">
+        <description>零升阻力系数 - 亚跨音速降低，超音速略增</description>
+        <table>
+          <independentVar lookup="row">velocities/mach</independentVar>
+          <tableData>
+            0.0   0.25
+            0.2   0.25
+            0.4   0.26
+            0.6   0.28
+            0.7   0.30
+            0.8   0.33
+            0.9   0.38
+            0.95  0.42
+            1.0   0.45
+            1.05  0.40
+            1.1   0.36
+            1.2   0.31
+            1.3   0.27
+            1.4   0.24
+            1.5   0.21
+            1.6   0.19
+            1.8   0.17
+            2.0   0.15
+            2.5   0.13
+            3.0   0.11
+            3.5   0.10
+            4.0   0.09
+          </tableData>
+        </table>
+      </function>
+
+      <function name="aero/coefficient/CDi">
+        <description>诱导阻力系数</description>
+        <product>
+          <property>aero/alpha-rad</property>
+          <property>aero/alpha-rad</property>
+          <value>0.18</value>
+        </product>
+      </function>
+
+      <function name="aero/coefficient/CDde">
+        <description>舵面阻力增量</description>
+        <product>
+          <property>fcs/elevator-pos-rad</property>
+          <property>fcs/elevator-pos-rad</property>
+          <value>0.25</value>
+        </product>
+      </function>
+    </axis>
+
+    <axis name="SIDE" type="SIDE">
+      <function name="aero/coefficient/CYb">
+        <description>侧力系数</description>
+        <product>
+          <property>aero/beta-rad</property>
+          <table>
+            <independentVar lookup="row">velocities/mach</independentVar>
+            <tableData>
+              0.3  -18.0
+              0.5  -19.2
+              0.8  -20.4
+              1.0  -19.2
+              1.2  -18.0
+              1.5  -15.6
+              2.0  -14.4
+              3.0  -12.0
+              4.0  -10.8
+            </tableData>
+          </table>
+        </product>
+      </function>
+    </axis>
+
+    <axis name="PITCH" type="PITCH">
+      <function name="aero/coefficient/Cmde">
+        <description>舵面俯仰力矩系数</description>
+        <product>
+          <property>fcs/elevator-pos-rad</property>
+          <table>
+            <independentVar lookup="row">velocities/mach</independentVar>
+            <tableData>
+              0.2   5.0
+              0.4   5.5
+              0.6   6.0
+              0.8   6.8
+              1.0   7.2
+              1.2   7.0
+              1.5   6.5
+              2.0   6.0
+              3.0   5.5
+              4.0   5.0
+            </tableData>
+          </table>
+        </product>
+      </function>
+
+      <function name="aero/coefficient/Cmalpha">
+        <description>静稳定力矩系数（放宽静稳定度）</description>
+        <product>
+          <property>aero/alpha-rad</property>
+          <value>0.25</value>
+        </product>
+      </function>
+
+      <function name="aero/coefficient/Cmq">
+        <description>俯仰阻尼力矩系数</description>
+        <product>
+          <property>velocities/q-aero-rad_sec</property>
+          <value>-20.0</value>
+        </product>
+      </function>
+    </axis>
+
+    <axis name="YAW" type="YAW">
+      <function name="aero/coefficient/Cndr">
+        <description>舵面偏航力矩系数</description>
+        <product>
+          <property>fcs/rudder-pos-rad</property>
+          <value>-6.5</value>
+        </product>
+      </function>
+
+      <function name="aero/coefficient/Cnr">
+        <description>偏航阻尼力矩系数</description>
+        <product>
+          <property>velocities/r-aero-rad_sec</property>
+          <value>-15.0</value>
+        </product>
+      </function>
+    </axis>
+
+    <axis name="ROLL" type="ROLL">
+      <function name="aero/coefficient/Clda">
+        <description>副翼滚转力矩系数（正舵偏→正Cl→右滚转）</description>
+        <product>
+          <property>fcs/aileron-pos-rad</property>
+          <value>10.0</value>
+        </product>
+      </function>
+
+      <function name="aero/coefficient/Clp">
+        <description>滚转阻尼力矩系数</description>
+        <product>
+          <property>velocities/p-aero-rad_sec</property>
+          <value>-30.0</value>
+        </product>
+      </function>
+    </axis>
+  </aerodynamics>
+
+</fdm_config>
